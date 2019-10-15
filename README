@@ -1,0 +1,20 @@
+Efficient scalable messaging backend skeleton to support hundreds of thousands
+of simultaneous users across multiple channels and thread under each channel post. 
+
+This solution uses Read Write mutex per channel and for concurrency letting 
+gorilla mux to provide concurrency that will handle majority of the high rate. 
+It could be better/efficient to utilize chan (CSP) instead of RWMutex here. 
+which is the solution already posted in blog: 
+http://marcio.io/2015/07/handling-1-million-requests-per-minute-with-golang/
+Also gorilla mux does not sound the fastest router out there so probably one
+can check other web routers for efficiency or create own implementation.
+
+To support enormous instant connections, one can run sub ranges in different machines
+line like start with 'a' run on one machine and 'b' another machine for 26 machines. Also I 
+kept everything in memory to make it faster. Currently did not added createdAt
+type time info into struct, by adding time info and running some cron jobs at night any
+silent channels more than 3-4 hours can be written to a logfile and removed for the memory
+in case memory usage may reach high levels.
+
+
+
