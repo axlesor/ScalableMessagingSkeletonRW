@@ -11,6 +11,7 @@ import (
 	"github.com/gorilla/mux"
 )
 
+// Each message can have multiple sub conversations
 type Thread struct {
 	Username string `json:"username"`
 	Message  string `json:"message"`
@@ -23,16 +24,21 @@ type msgPost struct {
 	Threads  []Thread `json:"thread"`
 }
 
+type subject struct {
+	sync.RWMutex
+	Messages []msgPost
+	title    string
+}
+
 // will keep messages in memory and whenever a channel closed, write it to a logfile in local disk
 // name of log may include date and name of user to search later: this part is not implemented
-var liveMessages map[string][]msgPost
+var liveMessages map[string]*subject
 
 // Since not utilizing DB for concurrency issues, RWMutex is preliminary solution per channel.
 // Using DB will be significantly slow, so keep messages in memory and handle the critical regions
 // since gorilla mux will kick goroutines(creates its concurrency) to handle each request
-// only lock for the same channel and not using a global RWMutex to slow down:
-var liveRWMutex map[string]*sync.RWMutex
-
+// only lock for the same channel and do not use a global RWMutex to slow down.
+// Need globalMutex only for initial creation of subject for each channel
 var globalMutex sync.Mutex
 
 func getMessage(w http.ResponseWriter, r *http.Request) {
@@ -51,25 +57,22 @@ func getMessage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if liveRWMutex[channel] != nil {
-		liveRWMutex[channel].RLock()
-		defer liveRWMutex[channel].RUnlock()
+
+	subject, ok := liveMessages[channel]
+	if ok {
 		// Critical region
-		messages, ok := liveMessages[channel]
-		if ok {
-			if id >= len(messages) {
-				respondJSON(w, http.StatusBadRequest, "No new message after last_id")
-				return
-			}
-			respondJSON(w, http.StatusOK, map[string][]msgPost{"messages": messages[id:]})
-		} else {
-			// This condition should not occur but left it just in case
-			respondJSON(w, http.StatusBadRequest, "Sorry No such channel exist!")
+		subject.RLock()
+		defer subject.RUnlock()
+		if id >= len(subject.Messages) {
+			respondJSON(w, http.StatusBadRequest, "No new message after last_id")
+			return
 		}
-		// End of Critical region
+		respondJSON(w, http.StatusOK, map[string][]msgPost{"messages": subject.Messages[id:]})
 	} else {
-		respondJSON(w, http.StatusBadRequest, "Upps No such channel exist!")
+		// Channel do not exist
+		respondJSON(w, http.StatusBadRequest, "Sorry No such channel exist!")
 	}
+	// End of Critical region
 
 }
 
@@ -83,25 +86,20 @@ func getThreads(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if liveRWMutex[channel] != nil {
-		liveRWMutex[channel].RLock()
-		defer liveRWMutex[channel].RUnlock()
+	subject, ok := liveMessages[channel]
+	if ok {
 		// Critical region
-		messages, ok := liveMessages[channel]
-		if ok {
-			if id >= len(messages) {
-				respondJSON(w, http.StatusBadRequest, "No new message after last_id")
-				return
-			}
-			respondJSON(w, http.StatusOK, map[string][]Thread{"messages": messages[id].Threads})
-		} else {
-			// This condition should not occur but left it just in case
-			respondJSON(w, http.StatusBadRequest, "Sorry No such channel exist!")
+		subject.RLock()
+		defer subject.RUnlock()
+		if id >= len(subject.Messages) {
+			respondJSON(w, http.StatusBadRequest, "No message for the provided id")
+			return
 		}
-		// End of Critical region
+		respondJSON(w, http.StatusOK, map[string][]Thread{"messages": subject.Messages[id].Threads})
 	} else {
-		respondJSON(w, http.StatusBadRequest, "Upps No such channel exist!")
+		respondJSON(w, http.StatusBadRequest, "Sorry No such channel exist!")
 	}
+	// End of Critical region
 
 }
 
@@ -124,27 +122,28 @@ func postMessage(w http.ResponseWriter, r *http.Request) {
 	//fmt.Printf("Received: %+v\n", mesg)
 
 	if mesg.Username != "" && mesg.Message != "" {
-		// Add the new message and user into the corresponding channel
-		// may need better concurrency solution here
-		if liveRWMutex[channel] == nil {
-			// Initialize Read write mutex only Once
-			// This could be better to do in thread creation but in this quick
+		// If it is the first time than create subject for the channel
+		// may use better concurrency solution here!
+		if liveMessages[channel] == nil {
+			// Initialize Subject only Once
+			// This could be better to do in subject creation: in this quick
 			// implementation done here to provide thread safety
 			globalMutex.Lock()
 			defer globalMutex.Unlock()
-			if liveRWMutex[channel] == nil {
-				liveRWMutex[channel] = &sync.RWMutex{}
+			// Double checking to make sure no two threads come here at the same time
+			if liveMessages[channel] == nil {
+				liveMessages[channel] = &subject{}
 			}
 		}
 		var id int
 		{
-			// Begining of critical region
-			liveRWMutex[channel].Lock()
-			defer liveRWMutex[channel].Unlock()
-			id = len(liveMessages[channel])
+			// Begining of critical region, get Write mutex
+			liveMessages[channel].Lock()
+			defer liveMessages[channel].Unlock()
+			id = len(liveMessages[channel].Messages)
 			id++ // increment id and update
 			mesg.Id = id
-			liveMessages[channel] = append(liveMessages[channel], mesg)
+			liveMessages[channel].Messages = append(liveMessages[channel].Messages, mesg)
 			// End of critical region
 		}
 
@@ -157,7 +156,8 @@ func postMessage(w http.ResponseWriter, r *http.Request) {
 
 // curl -X POST http://localhost:8000/gdgsas022/messages -d '{"username": "arthur", "message": "How are you"}' -v
 // curl -X POST http://localhost:8000/gdgsas022/messages -d '{"username": "sandy", "message": "sdasdh lsdhsalhdlahdlshdld"}' -v
-// curl -X GET http://localhost:8000/thread/gdgsas022/1 -v
+// curl  POST http://localhost:8000/gdgsas022/thread/1 -d '{"username": "sally", "message": "Nice sldhsld asdhasfh fhsf hdahdahdhas"}' -v
+// curl -X GET http://localhost:8000/gdgsas022/thread/1 -v
 func postThread(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	channel := vars["channel"]
@@ -180,16 +180,21 @@ func postThread(w http.ResponseWriter, r *http.Request) {
 	if mesg.Username != "" && mesg.Message != "" {
 		// Add the new message and user into the corresponding channel
 		// may need better concurrency solution here
-		if liveRWMutex[channel] == nil {
-			// there is no channel for this thread
+		if liveMessages[channel] == nil {
+			// no channel for this thread
 			respondJSON(w, http.StatusBadRequest, "Provided channel does not exist!")
 			return
 		}
 		{
+			// make sure message id is valid
+			if id >= len(liveMessages[channel].Messages) {
+				respondJSON(w, http.StatusBadRequest, "Provided messageId does not exist!")
+				return
+			}
 			// Begining of critical region
-			liveRWMutex[channel].Lock()
-			defer liveRWMutex[channel].Unlock()
-			liveMessages[channel][id].Threads = append(liveMessages[channel][id].Threads, mesg)
+			liveMessages[channel].Lock()
+			defer liveMessages[channel].Unlock()
+			liveMessages[channel].Messages[id].Threads = append(liveMessages[channel].Messages[id].Threads, mesg)
 			// End of critical region
 		}
 
@@ -221,8 +226,7 @@ func main() {
 	fmt.Println("Messaging Service v0.01 started at port ", port)
 	router := mux.NewRouter()
 	// Messages will be stored according to their channel
-	liveMessages = make(map[string][]msgPost)
-	liveRWMutex = make(map[string]*sync.RWMutex)
+	liveMessages = make(map[string]*subject)
 
 	router.HandleFunc("/{channel:[A-Z,a-z,0-9,-]+}/messages", getMessage).Methods("GET")
 	router.HandleFunc("/{channel:[A-Z,a-z,0-9,-]+}/messages", postMessage).Methods("POST")
