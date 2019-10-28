@@ -30,16 +30,19 @@ type subject struct {
 	title    string
 }
 
-// will keep messages in memory and whenever a channel closed, write it to a logfile in local disk
+// keep messages in memory and whenever a channel closed, write it to a logfile in local disk
 // name of log may include date and name of user to search later: this part is not implemented
+// In production this map needs to be a concurrent map like Map etc:
 var liveMessages map[string]*subject
 
 // Since not utilizing DB for concurrency issues, RWMutex is preliminary solution per channel.
 // Using DB will be significantly slow, so keep messages in memory and handle the critical regions
 // since gorilla mux will kick goroutines(creates its concurrency) to handle each request
-// only lock for the same channel and do not use a global RWMutex to slow down.
-// Need globalMutex only for initial creation of subject for each channel
-var globalMutex sync.Mutex
+// only lock for the same channel and do not use a global RWMutex to slow down. But this
+// code will have limited maintainability due to concurrency for map is not solid as mentioned above
+
+// Need globalMapMutex only for initial creation of subject for each channel
+var globalMapMutex sync.Mutex
 
 func getMessage(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
@@ -128,10 +131,12 @@ func postMessage(w http.ResponseWriter, r *http.Request) {
 			// Initialize Subject only Once
 			// This could be better to do in subject creation: in this quick
 			// implementation done here to provide thread safety
-			globalMutex.Lock()
-			defer globalMutex.Unlock()
+			globalMapMutex.Lock()
+			defer globalMapMutex.Unlock()
 			// Double checking to make sure no two threads come here at the same time
 			if liveMessages[channel] == nil {
+				// Currently this is the only place map is modified hence using plain map
+				// is nearly Ok here. In production map needs to be concurrent
 				liveMessages[channel] = &subject{}
 			}
 		}
@@ -186,14 +191,15 @@ func postThread(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		{
+			// Begining of critical region
+			liveMessages[channel].Lock()
+			defer liveMessages[channel].Unlock()
+
 			// make sure message id is valid
 			if id >= len(liveMessages[channel].Messages) {
 				respondJSON(w, http.StatusBadRequest, "Provided messageId does not exist!")
 				return
 			}
-			// Begining of critical region
-			liveMessages[channel].Lock()
-			defer liveMessages[channel].Unlock()
 			liveMessages[channel].Messages[id].Threads = append(liveMessages[channel].Messages[id].Threads, mesg)
 			// End of critical region
 		}
